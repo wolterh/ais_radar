@@ -229,7 +229,7 @@ local PANEL_W            = 460
 local VISIBLE_ROWS       = 14
 local ROW_H              = 26
 
-local MAX_AGE_S          = 180
+local MAX_AGE_S          = 360
 local RANGE_NM_MIN, RANGE_NM_MAX = 1, 96
 local RANGE_NM           = 24.0
 
@@ -271,8 +271,8 @@ local rxbuf = ""
 local targets   = {}  -- mmsi -> latest dynamic target {lat,lon,sog,cog,...}
 local shipinfo  = {}  -- mmsi -> {name=..., callsign=..., ...}
 local selected_mmsi = nil
-local own_lat, own_lon = 60.0, 5.0
-local own_valid = false
+local own_lat, own_lon = 52.1559267, 4.5116750
+local own_valid = true
 
 -- Ownship mode: UNLOCKED (estimate), LOCKED (freeze), FOLLOW (center on selected)
 local own_mode      = "UNLOCKED"
@@ -498,7 +498,7 @@ end
 -- =========================
 -- Networking
 -- =========================
-local function connect()
+local function connect_tcp()
   local ok, err
   conn, err = socket.tcp()
   if not conn then return nil, err end
@@ -514,6 +514,31 @@ local function connect()
   pcall(function() conn:setoption("keepalive", true)   end)
   return true
 end
+local function connect()
+  print("connecting ..." .. HOST ..":" .. tostring(PORT))
+  local ok, err
+
+  conn, err = socket.udp()
+  if not conn then
+    print("failed to connect")
+    return nil, err
+  end
+
+  -- UDP: bind op de lokale poort waar packets NAARTOE gestuurd worden (dst port)
+  pcall(function() conn:setoption("reuseaddr", true) end)
+  ok, err = conn:setsockname(HOST, PORT)   -- HOST="127.0.0.1", PORT=10110
+  if not ok then
+    print("failed to setsockname (bind)" .. err .. "!!")
+    conn:close()
+    conn = nil
+    return nil, err
+  end
+
+  conn:settimeout(0) -- non-blocking
+  print("udp listening on " .. HOST .. ":" .. tostring(PORT))
+  return true
+end
+
 
 local function reconnect()
   pcall(function() if conn then conn:close() end end)
@@ -523,27 +548,32 @@ local function reconnect()
 end
 
 -- Read bytes, split into lines, feed AIS
-local function pump_lines(max_chunks)
+local function pump_lines_tcp(max_chunks)
   if not conn then return end
   for _ = 1, max_chunks do
     local chunk, err, partial = conn:receive(4096)
-    -- print(chunk, err, partial)
+    -- print("chunk err partial", chunk, err, partial)
     local data = chunk or partial
     if data and #data > 0 then
       rxbuf = rxbuf .. data
+      print(data)
     end
     if err == "closed" then
+      print("reconnecting ...")
       reconnect()
       return
     end
     if err == "timeout" then
+      -- print("timeout")
       break
     end
     while true do
+      print("rxbuf: ", rxbuf)
       local nl = rxbuf:find("\n", 1, true)
       if not nl then break end
       local line = rxbuf:sub(1, nl - 1):gsub("\r$", "")
       rxbuf = rxbuf:sub(nl + 1)
+      print("feed line: ", line)
       local msg = ais.feed_line(line)
       if msg and msg.mmsi then
         if msg.type == 5 then
@@ -559,6 +589,54 @@ local function pump_lines(max_chunks)
     end
   end
 end
+local function pump_lines(max_chunks)
+  --print("pump_lines ", max_chunks)
+  if not conn then 
+    -- print("pump_lines, not connected")
+    return 
+  end
+  
+  for _ = 1, max_chunks do
+    -- Gebruik voor UDP bij voorkeur receive() zonder getal voor het volgende datagram
+    local data, err = conn:receive() 
+    
+    if data then
+      -- UDP levert per definitie één volledig pakket (meestal één regel)
+      rxbuf = rxbuf .. data .. "\n"
+      print("Data ontvangen:", data)
+    elseif err == "timeout" then
+      -- Bij UDP is timeout normaal: er is even geen data.
+      -- NIET breaken, maar gewoon doorgaan of stoppen voor deze tick.
+      return 
+    elseif err == "closed" then
+      reconnect()
+      return
+    end
+
+    -- Verwerk de rxbuf (hetzelfde als je al had)
+    while true do
+      local nl = rxbuf:find("\n", 1, true)
+      if not nl then break end
+      local line = rxbuf:sub(1, nl - 1):gsub("\r$", "")
+      rxbuf = rxbuf:sub(nl + 1)
+      
+      if #line > 0 then
+        local msg = ais.feed_line(line)
+        if msg and msg.mmsi then
+          if msg.type == 5 then
+            shipinfo[msg.mmsi] = { name = msg.name, callsign = msg.callsign, shiptype = msg.shiptype }
+          elseif msg.lat and msg.lon then
+            local info = shipinfo[msg.mmsi]
+            if info and info.name then msg.name = info.name end
+            msg.updated_at = os.time()
+            targets[msg.mmsi] = msg
+            if not selected_mmsi then selected_mmsi = msg.mmsi end
+          end
+        end
+      end
+    end
+  end
+end
 
 local function prune_targets()
   local now = os.time()
@@ -569,11 +647,59 @@ local function prune_targets()
     end
   end
 end
+local function estimate_ownship_from_targets()
+  local first_target = nil
+
+  -- Zoek naar het eerste target met een geldige positie
+  for _, t in pairs(targets) do
+    if t.lat and t.lon then
+      if not first_target then
+        first_target = t
+      end
+      
+      -- Optioneel: print voor debugging
+      -- print("Target gevonden: ", t.lat, t.lon)
+    end
+  end
+
+  -- Als we helemaal geen targets hebben, stop de functie
+  if not first_target then return end
+
+  if not own_valid then
+    -- PRIORITEIT: Neem direct de positie van het eerste target over
+    own_lat = first_target.lat
+    own_lon = first_target.lon
+    own_valid = true
+    print("Eerste fix verkregen via target: ", own_lat, own_lon)
+  else
+    -- Als we al een positie hebben, gebruik een gewogen gemiddelde
+    -- om sprongen te voorkomen wanneer er nieuwe targets bij komen.
+    -- We gebruiken hier alle targets die momenteel bekend zijn.
+    local sumLat, sumLon, count = 0, 0, 0
+    for _, t in pairs(targets) do
+      if t.lat and t.lon then
+        sumLat = sumLat + t.lat
+        sumLon = sumLon + t.lon
+        count = count + 1
+      end
+    end
+
+    if count > 0 then
+      local avgLat = sumLat / count
+      local avgLon = sumLon / count
+      
+      -- Filter: 90% oude positie, 10% nieuwe gemiddelde data
+      own_lat = own_lat * 0.90 + avgLat * 0.10 + 0.01
+      own_lon = own_lon * 0.90 + avgLon * 0.10 + 0.01
+    end
+  end
+end
+
 
 -- =========================
 -- Ownship estimation / dead reckoning
 -- =========================
-local function estimate_ownship_from_targets()
+local function estimate_ownship_from_targets_10targets()
 -- 3,0,244690728,5,-128.0,0.0,1,4.5024600,E,52.1912467,N,360.0,511,52,0,0,1
 -- 3,0,244690728,5,-128.0,0.0,1,4.5024633,E,52.1912483,N,360.0,511,53,0,0,1
 -- 3,0,244690728,5,-128.0,0.0,1,4.5024600,E,52.1912367,N,360.0,511,53,0,0,1
